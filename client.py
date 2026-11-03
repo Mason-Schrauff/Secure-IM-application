@@ -23,11 +23,22 @@ import threading
 
 def client():
     host = '127.0.0.1'
-    port = 12345
+    port = 1234
 
+    clientSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    clientSocket.connect((host, port))
 
+    message = input(" -> ")
 
+    while message.lower().strip() != '/quit':
+        clientSocket.sendall(message.encode())
+        raw = clientSocket.recv(1024)
+        data = raw.decode('utf-8')
+        print('server message: ' + data)
 
+        message = input(" -> ")
+
+    clientSocket.close()
 
 
 if __name__ == '__main__':

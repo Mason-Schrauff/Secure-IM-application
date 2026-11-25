@@ -3,6 +3,7 @@ import threading
 import base64
 import json
 import struct
+import queue
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.serialization import load_pem_public_key
@@ -14,11 +15,16 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.exceptions import InvalidSignature
 
 peer = None     # socket of current chat peer
-activePeerName = None   # Name of the current chat peer
+activeSession = None   # sessionID with the current chat peer
 peerLock = threading.Lock()
 
 serverConn = None                 # socket to server
 serverLock = threading.Lock()  
+
+replyQueue = queue.Queue()        # Server replies for the main thread
+
+pendingSessions = {} # session IDs server told us about for chats we were asked to join
+sessionCond = threading.Condition()
 
 # publicly agreed upon diffie hellman values
 P = int("""
@@ -39,10 +45,10 @@ def sendToServer(text):
         serverConn.sendall(text.encode() + b"\n")
 
 
-def releaseChat(peerName):
+def releaseChat(sessionID):
     # tell the server this chat is over so both users stop being marked busy.
     try:
-        sendToServer(f"/endchat {peerName}")
+        sendToServer(f"/endchat {sessionID}")
     except OSError:
         pass
 
@@ -54,16 +60,39 @@ def closeSocket(sock):
         pass
     sock.close()
 
+def serverListener(reader):
+    # reads everything the server sends. session notices are handled here
+    # anything else is a reply to a command and goes to main thread
+    try:
+        while True:
+            line = reader.readline()
+            if not line:
+                break
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+ 
+            if msg.get("type") == "session":
+                with sessionCond:
+                    pendingSessions[msg["session"]] = msg["peer"]
+                    sessionCond.notify_all()
+            else:
+                replyQueue.put(msg)
+    except OSError:
+        pass
+    finally:
+        replyQueue.put(None)
 
-def peerChat(peerSocket, peerName):
-    global peer, activePeerName
-
+def peerChat(peerSocket, peerName, sessionID):
+    global peer, activeSession
+ 
     try:
         while True:
             peerMsg = peerSocket.recv(1024).decode()
             if not peerMsg:
                 break
-
+ 
             print(f"[{peerName}] {peerMsg}")
     except OSError:
         pass
@@ -72,15 +101,15 @@ def peerChat(peerSocket, peerName):
             wasActive = peer is peerSocket
             if wasActive:
                 peer = None
-                activePeerName = None
+                activeSession = None
         closeSocket(peerSocket)
         print(f"[client] Chat with {peerName} has ended")
         if wasActive:
-            releaseChat(peerName)
+            releaseChat(sessionID)
 
 
 def acceptPeer(chatSocket):
-    global peer, activePeerName
+    global peer, activeSession
     while True:
         try:
             peerSocket, address = chatSocket.accept()
@@ -88,8 +117,24 @@ def acceptPeer(chatSocket):
             break
 
         try:
-            peerName = peerSocket.recv(1024).decode()
+            incommingChat = json.loads(peerSocket.recv(1024).decode())
+            peerName = incommingChat["name"]
+            sessionID = incommingChat["session"]
         except OSError:
+            peerSocket.close()
+            continue
+
+        # accept only if the server told us about this session and caller
+        with sessionCond:
+            known = sessionCond.wait_for(lambda: pendingSessions.get(sessionID) == peerName, timeout=5)
+            if known:
+                del pendingSessions[sessionID]
+ 
+        if not known:
+            try:
+                peerSocket.sendall("REJECT".encode())
+            except OSError:
+                pass
             peerSocket.close()
             continue
 
@@ -99,42 +144,42 @@ def acceptPeer(chatSocket):
                 peerSocket.close()
                 continue
             peer = peerSocket
-            activePeerName = peerName
+            activeSession = sessionID
 
         peerSocket.sendall("ACCEPT".encode())
 
-        print(f"[client] Chat started with {peerName}, type /endchat to terminate session.")
-        thread = threading.Thread(target=peerChat, args=(peerSocket, peerName), daemon=True)
+        print(f"[client] Chat started with {peerName} (session {sessionID}), type /endchat to terminate session")
+        thread = threading.Thread(target=peerChat, args=(peerSocket, peerName, sessionID), daemon=True)
         thread.start()
 
 
-def peerConnection(peerIP, peerPort, clientName, peerName):
-    global peer, activePeerName
+def peerConnection(peerIP, peerPort, clientName, peerName, sessionID):
+    global peer, activeSession
 
     peerSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
     try:
         peerSocket.connect((peerIP, peerPort))
-        peerSocket.sendall(clientName.encode())
+        peerSocket.sendall(json.dumps({"name": clientName, "session": sessionID}).encode())
         request = peerSocket.recv(1024).decode()
     except OSError:
         print("[client] Peer connection request error")
         peerSocket.close()
-        releaseChat(peerName)   # server already marked us busy, undo it
+        releaseChat(sessionID)   # server already marked us busy, undo it
         return
 
     if request != "ACCEPT":
-        print(request)
+        print(f"[client] {peerName} did not accept the chat request")
         peerSocket.close()
-        releaseChat(peerName)
+        releaseChat(sessionID)
         return
 
     with peerLock:
         peer = peerSocket
-        activePeerName = peerName
+        activeSession = sessionID
 
-    print(f"[client] Chat started with {peerName}, type /endchat to terminate session.")
-    thread = threading.Thread(target=peerChat, args=(peerSocket, peerName), daemon=True)
+    print(f"[client] Chat started with {peerName} (session {sessionID}), type /endchat to terminate session.")
+    thread = threading.Thread(target=peerChat, args=(peerSocket, peerName, sessionID), daemon=True)
     thread.start()
 
 
@@ -196,7 +241,7 @@ def client():
 
     dhForServer = params.generate_private_key()
 
-    # recieve challenge from server
+    # receive challenge from server
 
     serverChallenge = int(clientSocket.recv(1024).decode())
 
@@ -225,9 +270,11 @@ def client():
 
     clientSocket.sendall(json.dumps(handShake).encode() + b"\n")
 
+    reader = clientSocket.makefile("rb")
+
     # recieve serverDHkey and create sharedDHkey
 
-    serverDHKeyBytes = base64.b64decode(clientSocket.recv(2048).decode())
+    serverDHKeyBytes = base64.b64decode(reader.readline().strip())
 
     pubDH = serialization.load_pem_public_key(serverDHKeyBytes)
 
@@ -240,9 +287,11 @@ def client():
         info=b'handshake data',
     ).derive(sharedDH)
 
-    serverMsg = clientSocket.recv(1024).decode()
+    servMSG = json.loads(reader.readline())
 
-    print('[server] ' + serverMsg)
+    print('[server] ' + servMSG["text"])
+
+    threading.Thread(target=serverListener, args=(reader,), daemon=True).start()
 
     while True:
 
@@ -255,17 +304,16 @@ def client():
 
         with peerLock:
             p = peer
-            pName = activePeerName
+            pName = activeSession
 
-        # ---- In a chat: nothing reaches the server except the end-of-chat notice ----
+        #  in a chat, nothing reaches the server except the end of chat notice 
         if p:
             if command == '/quit':
                 closeSocket(p)
                 break
 
             if command == '/endchat':
-                # Tell the server right away (the server ignores duplicates), then
-                # close the socket; peerChat() cleans up the local state.
+                # tell the server, then close the socket
                 releaseChat(pName)
                 closeSocket(p)
             elif message.startswith('/'):
@@ -277,7 +325,7 @@ def client():
                     print("[client] Peer connection error.")
             continue
 
-        # ---- Not in a chat ----
+        # not in a chat
         if command == '/quit':
             break
 
@@ -294,17 +342,21 @@ def client():
                 print("[client] Can't initiate chat with yourself.")
                 continue
 
-        sendToServer(message)
-        serverMsg = clientSocket.recv(1024).decode()
-
-        if command == '/chat':
-            chatRequest = serverMsg.split()
-            if len(chatRequest) == 2 and chatRequest[1].isdigit():
-                peerConnection(chatRequest[0], int(chatRequest[1]), name, message.split()[1])
-            else:
-                print('[server] ' + serverMsg)
+        try:
+            sendToServer(message)
+        except OSError:
+            print("[client] Lost connection to the server.")
+            break
+ 
+        serverMsg = replyQueue.get()
+        if serverMsg is None:
+            print("[client] Lost connection to the server.")
+            break
+ 
+        if serverMsg.get("type") == "chat_approved":
+            peerConnection(serverMsg["ip"], serverMsg["port"], name, serverMsg["peer"], serverMsg["session"])
         else:
-            print('[server] ' + serverMsg)
+            print('[server] ' + serverMsg.get("text", ""))
 
     clientSocket.close()
     chatSocket.close()

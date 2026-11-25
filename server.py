@@ -29,8 +29,15 @@ E39E772C 180E8603 9B2783A2 EC07A28F B5C55DF0 6F4C52C9 DE2BCBF6 95581718
 """.replace("\n", "").replace(" ", ""), 16)
 G = 2
 
+def sendMsg(info, obj):
+    # server to client messages are one JSON object per line
+    # lock is needed as another client's thread may push a message to this client
+    data = json.dumps(obj).encode() + b"\n"
+    with info["sendLock"]:
+        info["sock"].sendall(data)
+
 def handelClient(clientSocket, address):
-    global P, G
+    global P, G, onlineClients
 
     params = dh.DHParameterNumbers(P, G).parameters()
     dhForClient = params.generate_private_key()
@@ -74,7 +81,7 @@ def handelClient(clientSocket, address):
         format=serialization.PublicFormat.SubjectPublicKeyInfo,
     )
 
-    clientSocket.sendall(base64.b64encode(pubDHBytes).decode().encode())
+    clientSocket.sendall(base64.b64encode(pubDHBytes) + b"\n")
 
     # shared key between server and client
     pubDH = serialization.load_pem_public_key(clientDHKeyBytes)
@@ -88,14 +95,14 @@ def handelClient(clientSocket, address):
         info=b'handshake data',
     ).derive(sharedDH)
 
-    clientInfo = {"name": clientName, "addr": (address[0], int(listenPort)), "partner": None}
+    clientInfo = {"name": clientName, "addr": (address[0], int(listenPort)), "partner": None,
+                  "session": None, "sock": clientSocket, "sendLock": threading.Lock()}
 
-    global onlineClients
     with clientLock:
         onlineClients.append(clientInfo)
 
     welcome = "welcome to the server " + clientName + "\nType /list to see all online users. \nType /chat username to request a chat with another user."
-    clientSocket.sendall(welcome.encode())
+    sendMsg(clientInfo, {"type": "reply", "text": welcome})
     
     try:
         while True:
@@ -112,9 +119,11 @@ def handelClient(clientSocket, address):
             if command == '/endchat':
                 with clientLock:
                     partner = clientInfo["partner"]
-                    if partner is not None and len(parts) > 1 and partner["name"] == parts[1]:
+                    if partner is not None and len(parts) > 1 and clientInfo["session"] == parts[1]:
                         partner["partner"] = None
+                        partner["session"] = None
                         clientInfo["partner"] = None
+                        clientInfo["session"] = None
                         print(f"[server] chat ended: {clientName} / {parts[1]}")
                     else:
                         print(f"[server] ignored '{clientMessage}' from {clientName} (partner: {partner['name'] if partner else None})")
@@ -124,43 +133,69 @@ def handelClient(clientSocket, address):
             with clientLock:
                 inChat = clientInfo["partner"] is not None
             if inChat and command in ('/list', '/chat'):
-                clientSocket.sendall("You are currently in a chat. Use /endchat to leave it first.".encode())
+                sendMsg(clientInfo, {"type": "reply", "text": "You are currently in a chat. Use /endchat to leave it first."})
                 continue
 
             if command == '/list':
                 with clientLock:
                     userList = ' '.join([c["name"] for c in onlineClients])
 
-                clientSocket.sendall(userList.encode())
+                sendMsg(clientInfo, {"type": "reply", "text": userList})
                 continue
 
             if command == '/chat':
                 if len(parts) < 2:
-                    clientSocket.sendall("Wrong command format. Use /chat username.".encode())
+                    sendMsg(clientInfo, {"type": "reply", "text": "Wrong command format. Use /chat username."})
                     continue
  
                 requestedUser = parts[1]
+
+                error = None
+                approved = None
+                sessionID = None
  
                 with clientLock:
                     target = next((c for c in onlineClients if c["name"] == requestedUser), None)
  
                     if target is None:
-                        reply = "Could not find requested user. Please try again."
+                        error = "Could not find requested user. Please try again."
                     elif target is clientInfo:
-                        reply = "Can't initiate chat with yourself."
+                        error = "Can't initiate chat with yourself."
                     elif target["partner"] is not None:
-                        reply = "User is currently in a chat with another user, please try again later."
+                        error = "User is currently in a chat with another user, please try again later."
                     else:
                         # both users busy as soon as the server approves chat
+                        sessionID = str(uuid.UUID(int=random.getrandbits(128), version=4))
                         clientInfo["partner"] = target
                         target["partner"] = clientInfo
-                        peerIP, peerPort = target["addr"]
-                        reply = f"{peerIP} {peerPort}"
+                        clientInfo["session"] = sessionID
+                        target["session"] = sessionID
+                        approved = target
  
-                clientSocket.sendall(reply.encode())
+                if approved is not None:
+                    try:
+                        # the requester gets the session ID first before caller's direct connection
+                        sendMsg(approved, {"type": "session", "peer": clientName, "session": sessionID})
+                    except OSError:
+                        with clientLock:
+                            if clientInfo["session"] == sessionID:
+                                clientInfo["partner"] = None
+                                clientInfo["session"] = None
+                            if approved["session"] == sessionID:
+                                approved["partner"] = None
+                                approved["session"] = None
+                        error = "Could not reach requested user. Please try again."
+                    else:
+                        peerIP, peerPort = approved["addr"]
+                        sendMsg(clientInfo, {"type": "chat_approved", "ip": peerIP, "port": peerPort,
+                                             "peer": requestedUser, "session": sessionID})
+                        print(f"[server] chat approved: {clientName} / {requestedUser} (session {sessionID})")
+ 
+                if error is not None:
+                    sendMsg(clientInfo, {"type": "reply", "text": error})
                 continue
  
-            clientSocket.sendall("Please enter valid commands /list or /chat".encode())
+            sendMsg(clientInfo, {"type": "reply", "text": "Please enter valid commands /list or /chat"})
     except OSError:
         print(clientName + " disconnected")
     finally:
@@ -170,7 +205,9 @@ def handelClient(clientSocket, address):
             partner = clientInfo["partner"]
             if partner is not None:
                 partner["partner"] = None
+                partner["session"] = None
                 clientInfo["partner"] = None
+                clientInfo["session"] = None
         clientSocket.close()
 
 def loadPublicKey(name: str):
